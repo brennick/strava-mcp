@@ -1,0 +1,24 @@
+# Caddy in front of the FastMCP server. Caddy terminates TLS via Let's Encrypt
+# using the HTTP-01 challenge, so TCP ports 80 and 443 must be reachable from
+# the public internet.
+#
+# If a CDN or reverse proxy fronts this host and re-terminates TLS, configure
+# it for end-to-end TLS validation against the certificate Caddy issues here.
+#
+# Set DOMAIN to the public hostname (e.g. strava-mcp.example.com) in .env.
+
+{$DOMAIN} {
+	encode zstd gzip
+
+	# Health probe doesn't need to hit the upstream.
+	handle /health {
+		respond "ok" 200
+	}
+
+	# Everything else (including /mcp) goes to the FastMCP container.
+	reverse_proxy strava-mcp:8080 {
+		# MCP streamable HTTP keeps the connection open while streaming chunks.
+		flush_interval -1
+		header_up X-Forwarded-Host {host}
+	}
+}
