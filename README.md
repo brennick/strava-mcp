@@ -73,8 +73,10 @@ TLS-terminating reverse proxy. Before deploying, make sure:
 git clone <this-repo-url> strava-mcp
 cd strava-mcp
 cp .env.example .env
-# Fill in: STRAVA_CLIENT_ID, STRAVA_CLIENT_SECRET, STRAVA_REFRESH_TOKEN,
-#          MCP_APPROVE_PASSWORD, DOMAIN.
+# Required values to set:
+#   STRAVA_CLIENT_ID, STRAVA_CLIENT_SECRET, STRAVA_REFRESH_TOKEN
+#   MCP_APPROVE_PASSWORD  (strong random secret — server refuses to start without it)
+#   DOMAIN                (public hostname Caddy will obtain a TLS cert for)
 mkdir -p data
 docker compose up -d --build
 ```
@@ -152,6 +154,33 @@ curl -i http://localhost:8080/mcp
 To obtain a token manually: `POST /register`, open `/authorize?...` in a
 browser, then `POST /token` with the returned code. In normal usage Claude
 Desktop performs all three steps automatically when the connector is added.
+
+## Hardening: restrict origin access to Anthropic's IP ranges
+
+Anthropic publishes the IP ranges Claude uses to call out to remote MCP
+servers at <https://platform.claude.com/docs/en/api/ip-addresses>. Allowlist
+the *outbound* range and block everything else at whichever layer fits your
+deployment:
+
+- **CDN / WAF in front of your origin** — an edge rule that blocks any
+  request whose source IP is not in the published Anthropic ranges.
+- **Host firewall** — `iptables` / `nftables` / a cloud-provider
+  network-security-group rule that drops inbound TCP on 80/443 from any
+  source not in those ranges.
+- **Application layer** — a reverse-proxy source-IP matcher, an `nginx`
+  `geo` block, ASGI middleware, etc.
+
+Belt-and-suspenders is fine — these layers don't conflict.
+
+One caveat: **`/authorize` must still be reachable from your own browser**
+during the connector setup flow. Claude Desktop opens the Approve URL
+locally rather than calling it server-side, so the request to `/authorize`
+originates from your device, not Anthropic. Either keep `/authorize`
+publicly reachable (relying on `MCP_APPROVE_PASSWORD` and the built-in
+rate limiter as the trust boundary), or restrict it to a private network
+you control (VPN, mesh network, jump host, etc.).
+
+---
 
 ## File layout
 

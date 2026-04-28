@@ -18,7 +18,9 @@ import hashlib
 import json
 import os
 import secrets
+import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -97,6 +99,39 @@ class OAuthStore:
         return self._data
 
 
+class RateLimiter:
+    """Thread-safe sliding-window rate limiter keyed by an arbitrary string.
+
+    Used to throttle abuse-prone endpoints (e.g. /authorize POST) per source IP.
+    State is in-memory; restarts reset all buckets, which is fine for the
+    intended use (slowing brute-force attempts, not enforcing quotas).
+    """
+
+    def __init__(self, *, max_attempts: int, window_seconds: int):
+        if max_attempts <= 0 or window_seconds <= 0:
+            raise ValueError("max_attempts and window_seconds must be positive")
+        self.max_attempts = max_attempts
+        self.window_seconds = window_seconds
+        self._buckets: dict[str, deque[float]] = {}
+        self._lock = threading.Lock()
+
+    def allow(self, key: str) -> bool:
+        """Record an attempt for `key` if under the limit; return True if allowed."""
+        now = time.time()
+        cutoff = now - self.window_seconds
+        with self._lock:
+            bucket = self._buckets.get(key)
+            if bucket is None:
+                bucket = deque()
+                self._buckets[key] = bucket
+            while bucket and bucket[0] < cutoff:
+                bucket.popleft()
+            if len(bucket) >= self.max_attempts:
+                return False
+            bucket.append(now)
+            return True
+
+
 class OAuthProvider:
     """OAuth 2.1 issuer for a personal MCP connector."""
 
@@ -109,6 +144,7 @@ class OAuthProvider:
         refresh_ttl: int = REFRESH_TOKEN_TTL,
         code_ttl: int = AUTH_CODE_TTL,
         scopes_supported: tuple[str, ...] = ("mcp",),
+        disable_dcr: bool = False,
     ):
         self.store = store
         self.approve_password = approve_password or None
@@ -116,6 +152,7 @@ class OAuthProvider:
         self.refresh_ttl = refresh_ttl
         self.code_ttl = code_ttl
         self.scopes_supported = list(scopes_supported)
+        self.disable_dcr = disable_dcr
 
     # ---------- discovery metadata ----------
 
@@ -143,6 +180,12 @@ class OAuthProvider:
     # ---------- dynamic client registration ----------
 
     def register_client(self, body: dict[str, Any]) -> dict[str, Any]:
+        if self.disable_dcr:
+            raise OAuthError(
+                "registration_disabled",
+                "dynamic client registration is disabled on this server",
+                status=403,
+            )
         cid = secrets.token_urlsafe(16)
         redirect_uris = list(body.get("redirect_uris") or [])
         record = {
@@ -160,6 +203,27 @@ class OAuthProvider:
         return {**record, "client_id_issued_at": record["created_at"]}
 
     # ---------- authorize (code issuance) ----------
+
+    def validate_authorize_request(
+        self, client_id: str, redirect_uri: str
+    ) -> dict[str, Any]:
+        """Look up client and verify redirect_uri is registered.
+
+        Raises OAuthError on unknown client_id or unregistered redirect_uri.
+        Returns the client record on success.
+        """
+        if not client_id:
+            raise OAuthError("invalid_request", "missing client_id")
+        client = self.store.data["clients"].get(client_id)
+        if not client:
+            raise OAuthError("invalid_client", "unknown client_id", status=401)
+        registered = client.get("redirect_uris") or []
+        if registered and redirect_uri not in registered:
+            raise OAuthError(
+                "invalid_request",
+                "redirect_uri is not registered for this client",
+            )
+        return client
 
     def issue_code(
         self,

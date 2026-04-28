@@ -34,7 +34,7 @@ from .aggregations import (
     speed_value,
     trim_activity,
 )
-from .oauth import OAuthError, OAuthProvider, OAuthStore
+from .oauth import OAuthError, OAuthProvider, OAuthStore, RateLimiter
 from .storage import TokenStore
 from .strava import StravaClient
 
@@ -392,7 +392,22 @@ def _hidden_inputs(params: dict[str, str]) -> str:
     return "\n".join(rows)
 
 
-def make_oauth_routes(provider: OAuthProvider) -> list[Route]:
+def _request_client_ip(request: Request) -> str:
+    """Best-effort real client IP, honoring common reverse-proxy headers."""
+    cf = request.headers.get("cf-connecting-ip")
+    if cf:
+        return cf.strip()
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def make_oauth_routes(
+    provider: OAuthProvider,
+    *,
+    authorize_rate_limiter: RateLimiter | None = None,
+) -> list[Route]:
 
     async def health(_request: Request) -> Response:
         return JSONResponse({"ok": True})
@@ -410,7 +425,13 @@ def make_oauth_routes(provider: OAuthProvider) -> list[Route]:
             body = {}
         if not isinstance(body, dict):
             return JSONResponse({"error": "invalid_client_metadata"}, status_code=400)
-        return JSONResponse(provider.register_client(body), status_code=201)
+        try:
+            return JSONResponse(provider.register_client(body), status_code=201)
+        except OAuthError as e:
+            return JSONResponse(
+                {"error": e.code, "error_description": e.description},
+                status_code=e.status,
+            )
 
     async def authorize(request: Request) -> Response:
         if request.method == "GET":
@@ -424,8 +445,16 @@ def make_oauth_routes(provider: OAuthProvider) -> list[Route]:
             if method not in ("S256", "plain"):
                 return PlainTextResponse("unsupported code_challenge_method", status_code=400)
 
-            client_record = provider.store.data["clients"].get(params["client_id"])
-            client_name = (client_record or {}).get("client_name") or "An MCP client"
+            try:
+                client_record = provider.validate_authorize_request(
+                    params["client_id"], params["redirect_uri"]
+                )
+            except OAuthError as e:
+                return PlainTextResponse(
+                    f"{e.code}: {e.description}", status_code=e.status
+                )
+
+            client_name = client_record.get("client_name") or "An MCP client"
             page = _APPROVE_PAGE.format(
                 client_name=html.escape(client_name),
                 hidden_inputs=_hidden_inputs(params),
@@ -434,7 +463,16 @@ def make_oauth_routes(provider: OAuthProvider) -> list[Route]:
             )
             return HTMLResponse(page)
 
-        # POST
+        # POST — rate-limit FIRST so password brute-force is throttled.
+        if authorize_rate_limiter is not None:
+            ip = _request_client_ip(request)
+            if not authorize_rate_limiter.allow(ip):
+                return PlainTextResponse(
+                    "rate limit exceeded; try again in a minute",
+                    status_code=429,
+                    headers={"Retry-After": "60"},
+                )
+
         form = await request.form()
         params = {k: str(v) for k, v in form.items()}
         if provider.approve_password:
@@ -443,6 +481,14 @@ def make_oauth_routes(provider: OAuthProvider) -> list[Route]:
         for required in ("client_id", "redirect_uri", "code_challenge"):
             if not params.get(required):
                 return PlainTextResponse(f"missing parameter: {required}", status_code=400)
+        try:
+            provider.validate_authorize_request(
+                params["client_id"], params["redirect_uri"]
+            )
+        except OAuthError as e:
+            return PlainTextResponse(
+                f"{e.code}: {e.description}", status_code=e.status
+            )
         code = provider.issue_code(
             client_id=params["client_id"],
             redirect_uri=params["redirect_uri"],
@@ -609,6 +655,7 @@ def build_app(
     client: StravaClient | None = None,
     *,
     oauth_provider: OAuthProvider | None = None,
+    authorize_rate_limiter: RateLimiter | None = None,
 ):
     if client is None:
         token_path = Path(os.environ.get("STRAVA_TOKEN_PATH", DEFAULT_TOKEN_PATH))
@@ -620,13 +667,30 @@ def build_app(
         oauth_path = Path(os.environ.get("OAUTH_STORE_PATH", DEFAULT_OAUTH_PATH))
         oauth_store = OAuthStore(oauth_path)
         oauth_store.load()
-        approve_pw = os.environ.get("MCP_APPROVE_PASSWORD") or None
-        oauth_provider = OAuthProvider(oauth_store, approve_password=approve_pw)
+        approve_pw = os.environ.get("MCP_APPROVE_PASSWORD")
+        if not approve_pw:
+            raise RuntimeError(
+                "MCP_APPROVE_PASSWORD env var is required. Set it to a strong, "
+                "random secret — it is what guards the /authorize Approve page."
+            )
+        disable_dcr = os.environ.get(
+            "DISABLE_DYNAMIC_CLIENT_REGISTRATION", ""
+        ).lower() in ("1", "true", "yes")
+        oauth_provider = OAuthProvider(
+            oauth_store,
+            approve_password=approve_pw,
+            disable_dcr=disable_dcr,
+        )
+
+    if authorize_rate_limiter is None:
+        authorize_rate_limiter = RateLimiter(max_attempts=5, window_seconds=60)
 
     mcp = make_mcp(client)
     mcp_app = _get_http_app(mcp)
 
-    oauth_routes = make_oauth_routes(oauth_provider)
+    oauth_routes = make_oauth_routes(
+        oauth_provider, authorize_rate_limiter=authorize_rate_limiter
+    )
     oauth_app = Starlette(routes=oauth_routes)
 
     return StravaMCPApp(mcp_app, oauth_app, oauth_provider)

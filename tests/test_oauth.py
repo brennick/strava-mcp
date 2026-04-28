@@ -16,6 +16,7 @@ from strava_mcp.oauth import (
     OAuthError,
     OAuthProvider,
     OAuthStore,
+    RateLimiter,
     verify_pkce,
 )
 from strava_mcp.server import StravaMCPApp, make_oauth_routes
@@ -429,3 +430,206 @@ async def test_authorize_password_gate(tmp_path):
             "code_challenge_method": "S256", "approve_password": "hunter2",
         }, follow_redirects=False)
         assert r.status_code == 302
+
+
+# ---------- DCR disable + client_id/redirect_uri validation + rate limit ----------
+
+def test_disable_dcr_blocks_register(tmp_path):
+    store = OAuthStore(tmp_path / "oauth.json")
+    store.load()
+    p = OAuthProvider(store, disable_dcr=True)
+    with pytest.raises(OAuthError) as ei:
+        p.register_client({"redirect_uris": ["https://x/cb"]})
+    assert ei.value.code == "registration_disabled"
+    assert ei.value.status == 403
+
+
+def test_validate_authorize_unknown_client_raises(tmp_path):
+    p = _setup_provider(tmp_path)
+    with pytest.raises(OAuthError) as ei:
+        p.validate_authorize_request("does-not-exist", "https://x/cb")
+    assert ei.value.code == "invalid_client"
+    assert ei.value.status == 401
+
+
+def test_validate_authorize_redirect_uri_mismatch(tmp_path):
+    p = _setup_provider(tmp_path)
+    client = p.register_client({"redirect_uris": ["https://allowed/cb"]})
+    with pytest.raises(OAuthError) as ei:
+        p.validate_authorize_request(client["client_id"], "https://other/cb")
+    assert ei.value.code == "invalid_request"
+
+
+def test_validate_authorize_redirect_uri_match(tmp_path):
+    p = _setup_provider(tmp_path)
+    client = p.register_client({"redirect_uris": ["https://allowed/cb"]})
+    rec = p.validate_authorize_request(client["client_id"], "https://allowed/cb")
+    assert rec["client_id"] == client["client_id"]
+
+
+def test_validate_authorize_skips_when_no_redirect_uris_registered(tmp_path):
+    """Defensive: if a client registers without redirect_uris, accept any value."""
+    p = _setup_provider(tmp_path)
+    client = p.register_client({"redirect_uris": []})
+    rec = p.validate_authorize_request(client["client_id"], "https://anything/cb")
+    assert rec["client_id"] == client["client_id"]
+
+
+def test_rate_limiter_allows_then_blocks():
+    rl = RateLimiter(max_attempts=3, window_seconds=60)
+    assert rl.allow("ip1") is True
+    assert rl.allow("ip1") is True
+    assert rl.allow("ip1") is True
+    assert rl.allow("ip1") is False
+    # Independent buckets per key.
+    assert rl.allow("ip2") is True
+
+
+def test_rate_limiter_window_expires():
+    rl = RateLimiter(max_attempts=2, window_seconds=60)
+    rl.allow("ip")
+    rl.allow("ip")
+    assert rl.allow("ip") is False
+    # Force the bucket entries past the window.
+    bucket = rl._buckets["ip"]
+    bucket[0] = time.time() - 120
+    bucket[1] = time.time() - 120
+    assert rl.allow("ip") is True
+
+
+# ---------- HTTP-level: validation + DCR disable + rate limit ----------
+
+def _make_app_with(provider, *, rate_limiter=None):
+    async def fake_mcp_app(scope, receive, send):
+        if scope["type"] == "lifespan":
+            while True:
+                msg = await receive()
+                if msg["type"] == "lifespan.startup":
+                    await send({"type": "lifespan.startup.complete"})
+                elif msg["type"] == "lifespan.shutdown":
+                    await send({"type": "lifespan.shutdown.complete"})
+                    return
+        if scope["type"] == "http":
+            await send({"type": "http.response.start", "status": 200,
+                        "headers": [(b"content-type", b"application/json")]})
+            await send({"type": "http.response.body", "body": b'{"ok":true}'})
+
+    routes = make_oauth_routes(provider, authorize_rate_limiter=rate_limiter)
+    return StravaMCPApp(fake_mcp_app, Starlette(routes=routes), provider)
+
+
+@pytest.mark.asyncio
+async def test_register_returns_403_when_dcr_disabled(tmp_path):
+    store = OAuthStore(tmp_path / "oauth.json")
+    store.load()
+    provider = OAuthProvider(store, disable_dcr=True)
+    app = _make_app_with(provider)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="https://mcp.test") as c:
+        r = await c.post("/register", json={"redirect_uris": ["https://x/cb"]})
+        assert r.status_code == 403
+        assert r.json()["error"] == "registration_disabled"
+
+
+@pytest.mark.asyncio
+async def test_authorize_get_unknown_client_returns_401(tmp_path):
+    provider = _setup_provider(tmp_path)
+    app = _make_app_with(provider)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="https://mcp.test") as c:
+        _, challenge = _new_pkce_pair()
+        r = await c.get("/authorize", params={
+            "response_type": "code", "client_id": "does-not-exist",
+            "redirect_uri": "https://x/cb", "code_challenge": challenge,
+            "code_challenge_method": "S256",
+        })
+        assert r.status_code == 401
+        assert "invalid_client" in r.text
+
+
+@pytest.mark.asyncio
+async def test_authorize_post_redirect_uri_mismatch_returns_400(tmp_path):
+    provider = _setup_provider(tmp_path)
+    client = provider.register_client({"redirect_uris": ["https://allowed/cb"]})
+    app = _make_app_with(provider)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="https://mcp.test") as c:
+        _, challenge = _new_pkce_pair()
+        r = await c.post("/authorize", data={
+            "response_type": "code", "client_id": client["client_id"],
+            "redirect_uri": "https://elsewhere/cb",
+            "code_challenge": challenge, "code_challenge_method": "S256",
+        }, follow_redirects=False)
+        assert r.status_code == 400
+        assert "invalid_request" in r.text
+
+
+@pytest.mark.asyncio
+async def test_authorize_post_rate_limited(tmp_path):
+    provider = _setup_provider(tmp_path, password="hunter2")
+    client = provider.register_client({"redirect_uris": ["https://x/cb"]})
+    rl = RateLimiter(max_attempts=3, window_seconds=60)
+    app = _make_app_with(provider, rate_limiter=rl)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="https://mcp.test") as c:
+        _, challenge = _new_pkce_pair()
+        # 3 wrong-password attempts: each gets 403 (still under limit)
+        for _ in range(3):
+            r = await c.post("/authorize", data={
+                "response_type": "code", "client_id": client["client_id"],
+                "redirect_uri": "https://x/cb",
+                "code_challenge": challenge, "code_challenge_method": "S256",
+                "approve_password": "wrong",
+            }, follow_redirects=False)
+            assert r.status_code == 403
+        # 4th attempt: rate limited
+        r = await c.post("/authorize", data={
+            "response_type": "code", "client_id": client["client_id"],
+            "redirect_uri": "https://x/cb",
+            "code_challenge": challenge, "code_challenge_method": "S256",
+            "approve_password": "wrong",
+        }, follow_redirects=False)
+        assert r.status_code == 429
+        assert r.headers.get("retry-after") == "60"
+
+
+def test_build_app_requires_mcp_approve_password(monkeypatch, tmp_path):
+    """MCP_APPROVE_PASSWORD is required and build_app must refuse to start without it."""
+    from strava_mcp.server import build_app
+
+    monkeypatch.delenv("MCP_APPROVE_PASSWORD", raising=False)
+    monkeypatch.setenv("STRAVA_TOKEN_PATH", str(tmp_path / "tokens.json"))
+    monkeypatch.setenv("OAUTH_STORE_PATH", str(tmp_path / "oauth.json"))
+    monkeypatch.setenv("STRAVA_CLIENT_ID", "1")
+    monkeypatch.setenv("STRAVA_CLIENT_SECRET", "s")
+    monkeypatch.setenv("STRAVA_REFRESH_TOKEN", "r")
+
+    with pytest.raises(RuntimeError, match="MCP_APPROVE_PASSWORD"):
+        build_app()
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_uses_cf_connecting_ip(tmp_path):
+    """Different CF-Connecting-IP values get independent buckets."""
+    provider = _setup_provider(tmp_path, password="hunter2")
+    client = provider.register_client({"redirect_uris": ["https://x/cb"]})
+    rl = RateLimiter(max_attempts=2, window_seconds=60)
+    app = _make_app_with(provider, rate_limiter=rl)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="https://mcp.test") as c:
+        _, challenge = _new_pkce_pair()
+        data = {
+            "response_type": "code", "client_id": client["client_id"],
+            "redirect_uri": "https://x/cb",
+            "code_challenge": challenge, "code_challenge_method": "S256",
+            "approve_password": "wrong",
+        }
+        # IP A: exhaust the limit
+        for _ in range(2):
+            r = await c.post("/authorize", data=data, headers={"cf-connecting-ip": "1.1.1.1"}, follow_redirects=False)
+            assert r.status_code == 403
+        r = await c.post("/authorize", data=data, headers={"cf-connecting-ip": "1.1.1.1"}, follow_redirects=False)
+        assert r.status_code == 429
+        # IP B: still has its own quota
+        r = await c.post("/authorize", data=data, headers={"cf-connecting-ip": "2.2.2.2"}, follow_redirects=False)
+        assert r.status_code == 403
