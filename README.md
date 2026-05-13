@@ -19,9 +19,14 @@ so the connector keeps working past the first access-token expiry.
 |-------------------------|------------------------------------------------------------------------------|
 | `list_activities`       | Recent activities, newest first. Supports `after`, `before`, `types`, `limit`. |
 | `get_activity`          | Full detail (splits, description, gear, calories, map).                      |
+| `get_athlete`           | Profile, FTP, and bikes/shoes with cumulative mileage.                       |
 | `get_athlete_stats`     | Lifetime / YTD / 4-week totals for run, ride, swim.                          |
+| `get_athlete_zones`     | Heart-rate and power zone thresholds.                                        |
 | `summarize`             | Weekly or monthly rollups: distance, time, elevation, count, avg pace.       |
 | `get_activity_streams`  | Time-series streams (heartrate, velocity, altitude, etc.).                   |
+| `get_activity_laps`     | Per-lap distance / pace / HR / watts; exposes stream indices for slicing.    |
+| `get_activity_zones`    | Time-in-zone per activity with total seconds and per-bucket percent.         |
+| `get_gear`              | Full bike or shoe detail with cumulative distance.                           |
 
 Every tool accepts an optional `units` parameter (`"imperial"` or `"metric"`).
 The default is imperial unless the deployment's credentials file overrides it.
@@ -216,3 +221,8 @@ strava-mcp/
   refresh tokens and registered Claude clients). Losing it requires
   re-running both OAuth handshakes.
 - **Updates**: `git pull && docker compose up -d --build`.
+- **Subpath mounts**: if you front the server with a gateway that routes a
+  subpath (e.g. `/strava/*`) to it, set `X-Forwarded-Prefix` on the proxied
+  request. The server uses it to build OAuth discovery URLs, the Approve
+  form action, and the 401 `resource_metadata` URL so clients stay inside
+  the mount.
