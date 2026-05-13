@@ -272,6 +272,76 @@ async def test_metadata_endpoint_returns_json_with_issuer(app):
 
 
 @pytest.mark.asyncio
+async def test_metadata_honors_x_forwarded_prefix(app):
+    """When a gateway mounts this server at a subpath, issuer URLs include it."""
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="https://gateway.test") as c:
+        r = await c.get(
+            "/.well-known/oauth-authorization-server",
+            headers={"x-forwarded-prefix": "/strava"},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["issuer"] == "https://gateway.test/strava"
+        assert body["authorization_endpoint"] == "https://gateway.test/strava/authorize"
+        assert body["token_endpoint"] == "https://gateway.test/strava/token"
+        assert body["registration_endpoint"] == "https://gateway.test/strava/register"
+
+
+@pytest.mark.asyncio
+async def test_unauth_mcp_resource_metadata_url_honors_prefix(app):
+    """The 401 WWW-Authenticate resource_metadata URL also picks up the prefix."""
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="https://gateway.test") as c:
+        r = await c.get("/mcp", headers={"x-forwarded-prefix": "/strava"})
+        assert r.status_code == 401
+        www_auth = r.headers["www-authenticate"]
+        assert 'resource_metadata="https://gateway.test/strava/.well-known/oauth-protected-resource"' in www_auth
+
+
+@pytest.mark.asyncio
+async def test_authorize_form_action_honors_prefix(app):
+    """The Approve-page POST target stays inside the mount path."""
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="https://gateway.test") as c:
+        # Need a registered client first.
+        r = await c.post("/register", json={"redirect_uris": ["https://claude.ai/cb"], "client_name": "Claude"})
+        assert r.status_code == 201
+        client_id = r.json()["client_id"]
+
+        _, challenge = _new_pkce_pair()
+        r = await c.get(
+            "/authorize",
+            params={
+                "response_type": "code",
+                "client_id": client_id,
+                "redirect_uri": "https://claude.ai/cb",
+                "scope": "mcp",
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+            },
+            headers={"x-forwarded-prefix": "/strava"},
+        )
+        assert r.status_code == 200
+        assert 'action="/strava/authorize"' in r.text
+
+
+@pytest.mark.asyncio
+async def test_unknown_well_known_returns_404_not_401(app):
+    """OIDC and other /.well-known/* probes must 404, not 401.
+
+    Claude.ai's MCP connector probes /.well-known/openid-configuration during
+    discovery. A 401 there made it think the authorization server was broken
+    and bail out; a 404 correctly says "no OIDC, use OAuth 2.0" and it falls
+    back to the metadata it already got from oauth-protected-resource.
+    """
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="https://mcp.test") as c:
+        r = await c.get("/.well-known/openid-configuration")
+        assert r.status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_unauth_mcp_returns_401_with_www_authenticate(app):
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="https://mcp.test") as c:

@@ -328,12 +328,27 @@ def make_mcp(client: StravaClient) -> FastMCP:
 
 # ---------- OAuth route handlers ----------
 
+def _forwarded_prefix(header_value: str | None) -> str:
+    """Normalize an X-Forwarded-Prefix value to "" or "/segment[/segment...]".
+
+    Set by an upstream reverse proxy when this app is mounted at a subpath
+    (e.g., a gateway routing /strava/* to this container after stripping the
+    prefix). The server uses it so absolute URLs emitted in OAuth discovery
+    documents and the Approve form keep clients inside the mount.
+    """
+    p = (header_value or "").strip().rstrip("/")
+    if p and not p.startswith("/"):
+        p = "/" + p
+    return p
+
+
 def _issuer_from_request(request: Request) -> str:
     proto = request.headers.get("x-forwarded-proto") or request.url.scheme
     host = request.headers.get("x-forwarded-host") or request.headers.get("host")
     if not host:
         host = request.url.netloc
-    return f"{proto}://{host}".rstrip("/")
+    prefix = _forwarded_prefix(request.headers.get("x-forwarded-prefix"))
+    return f"{proto}://{host}{prefix}".rstrip("/")
 
 
 _APPROVE_PAGE = """<!doctype html>
@@ -363,7 +378,7 @@ button:hover{{filter:brightness(1.05)}}
     <li>Read your activities, splits, and streams</li>
     <li>Read your athlete profile and totals</li>
   </ul>
-  <form method="post" action="/authorize">
+  <form method="post" action="{authorize_action}">
 {hidden_inputs}
 {password_field}
     <button type="submit">Approve</button>
@@ -455,11 +470,13 @@ def make_oauth_routes(
                 )
 
             client_name = client_record.get("client_name") or "An MCP client"
+            prefix = _forwarded_prefix(request.headers.get("x-forwarded-prefix"))
             page = _APPROVE_PAGE.format(
                 client_name=html.escape(client_name),
                 hidden_inputs=_hidden_inputs(params),
                 password_field=_password_field_html(provider),
                 redirect_uri=html.escape(params["redirect_uri"]),
+                authorize_action=html.escape(f"{prefix}/authorize"),
             )
             return HTMLResponse(page)
 
@@ -579,7 +596,10 @@ class StravaMCPApp:
             await self.mcp_app(scope, receive, send)
             return
         path = scope.get("path", "")
-        if path in PUBLIC_PATHS:
+        # Any /.well-known/* probe (OIDC discovery, host-meta, etc.) is a
+        # public lookup by definition. Route them all to the OAuth Starlette
+        # app so unmapped ones return 404 instead of a misleading 401.
+        if path in PUBLIC_PATHS or path.startswith("/.well-known/"):
             await self.oauth_app(scope, receive, send)
             return
 
@@ -601,8 +621,8 @@ def _extract_bearer(scope) -> str | None:
 
 
 async def _send_401(scope, send) -> None:
-    proto, host = _derive_origin(scope)
-    resource_metadata_url = f"{proto}://{host}/.well-known/oauth-protected-resource"
+    proto, host, prefix = _derive_origin(scope)
+    resource_metadata_url = f"{proto}://{host}{prefix}/.well-known/oauth-protected-resource"
     body = json.dumps(
         {"error": "unauthorized", "error_description": "missing or invalid access token"}
     ).encode()
@@ -624,7 +644,7 @@ async def _send_401(scope, send) -> None:
     await send({"type": "http.response.body", "body": body})
 
 
-def _derive_origin(scope) -> tuple[str, str]:
+def _derive_origin(scope) -> tuple[str, str, str]:
     headers = {k: v for k, v in (scope.get("headers") or [])}
     proto = (
         headers.get(b"x-forwarded-proto", b"").decode()
@@ -638,7 +658,8 @@ def _derive_origin(scope) -> tuple[str, str]:
     if not host:
         s = scope.get("server") or ("localhost", 80)
         host = f"{s[0]}:{s[1]}"
-    return proto, host
+    prefix = _forwarded_prefix(headers.get(b"x-forwarded-prefix", b"").decode())
+    return proto, host, prefix
 
 
 # ---------- App factory + entrypoint ----------
