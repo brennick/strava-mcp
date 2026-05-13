@@ -20,6 +20,27 @@ from strava_mcp.oauth import (
     verify_pkce,
 )
 from strava_mcp.server import StravaMCPApp, make_oauth_routes
+from strava_mcp.storage import TokenStore
+from strava_mcp.strava_oauth import StravaOAuthClient
+
+
+def _wizard_deps(tmp_path):
+    """Build the wizard dependencies make_oauth_routes now requires.
+
+    The Strava OAuth client and token store aren't exercised by these older
+    OAuth-flow tests, so dummy values are fine.
+    """
+    token_path = tmp_path / "tokens.json"
+    import json as _json
+    token_path.write_text(_json.dumps({
+        "client_id": "1", "client_secret": "shh",
+        "refresh_token": "rt", "access_token": "at",
+        "expires_at": 0, "units": "imperial",
+    }))
+    ts = TokenStore(token_path)
+    ts.load_or_seed()
+    so = StravaOAuthClient(client_id="1", client_secret="shh")
+    return ts, so
 from starlette.applications import Starlette
 
 
@@ -256,7 +277,8 @@ def app(tmp_path):
                         "headers": [(b"content-type", b"application/json")]})
             await send({"type": "http.response.body", "body": b'{"mcp":"ok"}'})
 
-    routes = make_oauth_routes(provider)
+    ts, so = _wizard_deps(tmp_path)
+    routes = make_oauth_routes(provider, token_store=ts, strava_oauth=so)
     return StravaMCPApp(fake_mcp_app, Starlette(routes=routes), provider)
 
 
@@ -380,7 +402,7 @@ async def test_full_authorize_token_roundtrip_over_http(app):
         assert "Approve" in r.text
         assert client_id in r.text
 
-        # POST /authorize → 302 redirect with code
+        # POST /authorize → 303 to wizard (no longer mints code directly)
         r = await c.post(
             "/authorize",
             data={
@@ -394,11 +416,20 @@ async def test_full_authorize_token_roundtrip_over_http(app):
             },
             follow_redirects=False,
         )
+        assert r.status_code == 303
+        from urllib.parse import urlparse, parse_qs
+        wiz_loc = r.headers["location"]
+        session = parse_qs(urlparse(wiz_loc).query)["session"][0]
+
+        # The fixture's TokenStore was seeded with a refresh_token, so the
+        # wizard considers Strava already connected and shows the Done button.
+        # POST /wizard/done → 302 to claude with code+state.
+        r = await c.post(
+            "/wizard/done", data={"session": session}, follow_redirects=False
+        )
         assert r.status_code == 302
         loc = r.headers["location"]
         assert loc.startswith("https://claude.ai/cb")
-        # Pull the code out
-        from urllib.parse import urlparse, parse_qs
         qs = parse_qs(urlparse(loc).query)
         code = qs["code"][0]
         assert qs["state"] == ["xyz"]
@@ -466,7 +497,8 @@ async def test_authorize_password_gate(tmp_path):
                     await send({"type": "lifespan.shutdown.complete"})
                     return
 
-    routes = make_oauth_routes(provider)
+    ts, so = _wizard_deps(tmp_path)
+    routes = make_oauth_routes(provider, token_store=ts, strava_oauth=so)
     app = StravaMCPApp(fake_mcp_app, Starlette(routes=routes), provider)
 
     transport = httpx.ASGITransport(app=app)
@@ -493,13 +525,15 @@ async def test_authorize_password_gate(tmp_path):
         }, follow_redirects=False)
         assert r.status_code == 403
 
-        # POST with correct password → 302
+        # POST with correct password → 303 to the wizard (no longer a direct
+        # client redirect — the wizard finalizes that).
         r = await c.post("/authorize", data={
             "response_type": "code", "client_id": client_id,
             "redirect_uri": "https://x/cb", "code_challenge": challenge,
             "code_challenge_method": "S256", "approve_password": "hunter2",
         }, follow_redirects=False)
-        assert r.status_code == 302
+        assert r.status_code == 303
+        assert r.headers["location"].startswith("/wizard?session=")
 
 
 # ---------- DCR disable + client_id/redirect_uri validation + rate limit ----------
@@ -569,7 +603,7 @@ def test_rate_limiter_window_expires():
 
 # ---------- HTTP-level: validation + DCR disable + rate limit ----------
 
-def _make_app_with(provider, *, rate_limiter=None):
+def _make_app_with(provider, *, rate_limiter=None, tmp_path=None):
     async def fake_mcp_app(scope, receive, send):
         if scope["type"] == "lifespan":
             while True:
@@ -584,7 +618,15 @@ def _make_app_with(provider, *, rate_limiter=None):
                         "headers": [(b"content-type", b"application/json")]})
             await send({"type": "http.response.body", "body": b'{"ok":true}'})
 
-    routes = make_oauth_routes(provider, authorize_rate_limiter=rate_limiter)
+    # If tmp_path isn't passed, the caller doesn't care about the wizard deps;
+    # use ephemeral in-memory wizard deps anchored in a process-temp dir.
+    if tmp_path is None:
+        import tempfile
+        tmp_path = Path(tempfile.mkdtemp())
+    ts, so = _wizard_deps(tmp_path)
+    routes = make_oauth_routes(
+        provider, token_store=ts, strava_oauth=so, authorize_rate_limiter=rate_limiter
+    )
     return StravaMCPApp(fake_mcp_app, Starlette(routes=routes), provider)
 
 

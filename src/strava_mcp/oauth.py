@@ -58,7 +58,7 @@ def verify_pkce(verifier: str, challenge: str, method: str) -> bool:
 class OAuthStore:
     """Persists OAuth state to a single JSON file with atomic writes."""
 
-    SECTIONS = ("clients", "codes", "access_tokens", "refresh_tokens")
+    SECTIONS = ("clients", "codes", "access_tokens", "refresh_tokens", "pending_authorizations")
 
     def __init__(self, path: Path | str):
         self.path = Path(path).expanduser()
@@ -86,7 +86,7 @@ class OAuthStore:
     def cleanup_expired(self, *, now: float | None = None) -> None:
         now = now if now is not None else time.time()
         changed = False
-        for section in ("codes", "access_tokens", "refresh_tokens"):
+        for section in ("codes", "access_tokens", "refresh_tokens", "pending_authorizations"):
             for tid in list(self._data[section].keys()):
                 if self._data[section][tid].get("expires_at", 0) < now:
                     del self._data[section][tid]
@@ -331,4 +331,53 @@ class OAuthProvider:
             return None
         if rec.get("expires_at", 0) < time.time():
             return None
+        return rec
+
+    # ---------- pending authorizations (combined-flow wizard) ----------
+    #
+    # When the user submits the Approve form, we don't immediately mint an
+    # authorization code — Claude.ai's authorize-request params are stashed
+    # under a session_id and the user is redirected into a wizard that walks
+    # them through the Strava OAuth dance. The code is issued only when the
+    # wizard finalizes (Done).
+
+    def create_pending_authorization(
+        self,
+        *,
+        client_id: str,
+        redirect_uri: str,
+        scope: str,
+        state: str,
+        code_challenge: str,
+        code_challenge_method: str,
+    ) -> str:
+        sid = secrets.token_urlsafe(24)
+        self.store.data["pending_authorizations"][sid] = {
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "scope": scope or "mcp",
+            "state": state,
+            "code_challenge": code_challenge,
+            "code_challenge_method": code_challenge_method or "plain",
+            "expires_at": int(time.time()) + self.code_ttl,
+        }
+        self.store.save()
+        return sid
+
+    def get_pending_authorization(self, session_id: str) -> dict[str, Any] | None:
+        rec = self.store.data["pending_authorizations"].get(session_id)
+        if not rec:
+            return None
+        if rec.get("expires_at", 0) < time.time():
+            del self.store.data["pending_authorizations"][session_id]
+            self.store.save()
+            return None
+        return rec
+
+    def consume_pending_authorization(self, session_id: str) -> dict[str, Any] | None:
+        rec = self.get_pending_authorization(session_id)
+        if rec is None:
+            return None
+        del self.store.data["pending_authorizations"][session_id]
+        self.store.save()
         return rec

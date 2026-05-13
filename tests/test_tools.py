@@ -547,7 +547,20 @@ def _make_app(tmp_path):
     store = OAuthStore(tmp_path / "oauth.json")
     store.load()
     provider = OAuthProvider(store)
-    app = StravaMCPApp(_ok_app, Starlette(routes=make_oauth_routes(provider)), provider)
+    import json as _json
+    from strava_mcp.storage import TokenStore
+    from strava_mcp.strava_oauth import StravaOAuthClient
+    tp = tmp_path / "tokens.json"
+    tp.write_text(_json.dumps({
+        "client_id": "1", "client_secret": "shh",
+        "refresh_token": "rt", "access_token": "at",
+        "expires_at": 0, "units": "imperial",
+    }))
+    ts = TokenStore(tp)
+    ts.load_or_seed()
+    so = StravaOAuthClient(client_id="1", client_secret="shh")
+    routes = make_oauth_routes(provider, token_store=ts, strava_oauth=so)
+    app = StravaMCPApp(_ok_app, Starlette(routes=routes), provider)
     return app, provider
 
 

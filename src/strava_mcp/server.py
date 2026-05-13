@@ -39,6 +39,7 @@ from .aggregations import (
 from .oauth import OAuthError, OAuthProvider, OAuthStore, RateLimiter
 from .storage import TokenStore
 from .strava import StravaClient
+from .strava_oauth import StravaOAuthClient, StravaOAuthError
 
 DEFAULT_TOKEN_PATH = "/data/tokens.json"
 DEFAULT_OAUTH_PATH = "/data/oauth.json"
@@ -53,8 +54,13 @@ PUBLIC_PATHS = frozenset(
         "/register",
         "/authorize",
         "/token",
+        "/oauth/callback",
+        "/wizard",
     }
 )
+
+# Path prefixes that are also public (wizard sub-routes + well-known probes).
+PUBLIC_PREFIXES = ("/wizard/", "/.well-known/")
 
 
 # ---------- shared helpers ----------
@@ -526,6 +532,46 @@ def _issuer_from_request(request: Request) -> str:
     return f"{proto}://{host}{prefix}".rstrip("/")
 
 
+_WIZARD_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Connect Strava</title>
+<style>
+body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f6f8fa;color:#1f2328;margin:0;padding:2rem;display:flex;justify-content:center}}
+main{{max-width:480px;width:100%;background:#fff;border:1px solid #d1d9e0;border-radius:12px;padding:2rem;box-shadow:0 1px 3px rgba(0,0,0,.04)}}
+h1{{font-size:1.25rem;margin:0 0 .5rem}}
+p{{margin:.5rem 0;line-height:1.5;color:#59636e}}
+.notice{{padding:.6rem .8rem;border-radius:6px;margin:.8rem 0;font-size:.95rem}}
+.notice.ok{{background:#dafbe1;border:1px solid #2da44e;color:#1a7f37}}
+.notice.err{{background:#ffebe9;border:1px solid #cf222e;color:#82071e}}
+.status{{padding:.8rem 1rem;border:1px solid #d1d9e0;border-radius:8px;margin:1rem 0}}
+.status .label{{color:#59636e;font-size:.85rem}}
+.status .value{{font-weight:600;margin-top:.2rem}}
+.actions{{display:flex;gap:.6rem;margin-top:1rem}}
+.actions form{{flex:1;margin:0}}
+button{{width:100%;padding:.7rem;border:1px solid #d1d9e0;background:#fff;color:#1f2328;border-radius:6px;font-size:.95rem;cursor:pointer}}
+button.primary{{background:#fc4c02;color:#fff;border-color:#fc4c02}}
+button.primary:hover{{filter:brightness(1.05)}}
+</style>
+</head>
+<body>
+<main>
+  <h1>Connect Strava</h1>
+  <p>The client <strong>{client_name}</strong> will be able to read your activities, splits, streams, and profile.</p>
+  {notice_html}
+  {status_html}
+  <div class="actions">
+    {connect_form}
+    {done_form}
+  </div>
+</main>
+</body>
+</html>
+"""
+
+
 _APPROVE_PAGE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <title>Approve MCP access</title>
@@ -593,9 +639,82 @@ def _request_client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
+def _redirect_to_claude(redirect_uri: str, code: str, state: str) -> RedirectResponse:
+    parsed = urllib.parse.urlsplit(redirect_uri)
+    existing = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    existing.append(("code", code))
+    if state:
+        existing.append(("state", state))
+    new_query = urllib.parse.urlencode(existing)
+    target = urllib.parse.urlunsplit(
+        (parsed.scheme, parsed.netloc, parsed.path, new_query, parsed.fragment)
+    )
+    return RedirectResponse(target, status_code=302)
+
+
+def _render_wizard(
+    *,
+    base: str,
+    session: str,
+    client_name: str,
+    token_store: TokenStore,
+    notice_kind: str | None = None,
+    notice_text: str | None = None,
+) -> HTMLResponse:
+    connected = token_store.is_connected()
+    label = token_store.athlete_label()
+    if connected:
+        status_html = (
+            '<div class="status">'
+            '<div class="label">Strava</div>'
+            f'<div class="value">Connected{(" as " + html.escape(label)) if label else ""}</div>'
+            "</div>"
+        )
+        connect_form = (
+            f'<form method="post" action="{html.escape(base)}/wizard/connect">'
+            f'<input type="hidden" name="session" value="{html.escape(session)}">'
+            f'<button type="submit">Reconnect</button></form>'
+        )
+        done_form = (
+            f'<form method="post" action="{html.escape(base)}/wizard/done">'
+            f'<input type="hidden" name="session" value="{html.escape(session)}">'
+            f'<button type="submit" class="primary">Done</button></form>'
+        )
+    else:
+        status_html = (
+            '<div class="status">'
+            '<div class="label">Strava</div>'
+            '<div class="value">Not connected</div>'
+            "</div>"
+        )
+        connect_form = (
+            f'<form method="post" action="{html.escape(base)}/wizard/connect">'
+            f'<input type="hidden" name="session" value="{html.escape(session)}">'
+            f'<button type="submit" class="primary">Connect Strava</button></form>'
+        )
+        done_form = ""
+
+    notice_html = ""
+    if notice_kind and notice_text:
+        notice_html = (
+            f'<div class="notice {html.escape(notice_kind)}">{html.escape(notice_text)}</div>'
+        )
+
+    page = _WIZARD_PAGE.format(
+        client_name=html.escape(client_name),
+        status_html=status_html,
+        connect_form=connect_form,
+        done_form=done_form,
+        notice_html=notice_html,
+    )
+    return HTMLResponse(page)
+
+
 def make_oauth_routes(
     provider: OAuthProvider,
     *,
+    token_store: TokenStore,
+    strava_oauth: StravaOAuthClient,
     authorize_rate_limiter: RateLimiter | None = None,
 ) -> list[Route]:
 
@@ -681,7 +800,8 @@ def make_oauth_routes(
             return PlainTextResponse(
                 f"{e.code}: {e.description}", status_code=e.status
             )
-        code = provider.issue_code(
+        # Stash Claude's authorize-request params; hand off to the wizard.
+        session_id = provider.create_pending_authorization(
             client_id=params["client_id"],
             redirect_uri=params["redirect_uri"],
             scope=params.get("scope", "mcp"),
@@ -689,15 +809,130 @@ def make_oauth_routes(
             code_challenge=params["code_challenge"],
             code_challenge_method=params.get("code_challenge_method", "plain"),
         )
-        # Build redirect URL, preserving any existing query string in the redirect_uri.
-        parsed = urllib.parse.urlsplit(params["redirect_uri"])
-        existing = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
-        existing.append(("code", code))
-        if params.get("state"):
-            existing.append(("state", params["state"]))
-        new_query = urllib.parse.urlencode(existing)
-        target = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, new_query, parsed.fragment))
-        return RedirectResponse(target, status_code=302)
+        prefix = _forwarded_prefix(request.headers.get("x-forwarded-prefix"))
+        return RedirectResponse(
+            f"{prefix}/wizard?session={urllib.parse.quote(session_id)}",
+            status_code=303,
+        )
+
+    def _client_name(client_id: str) -> str:
+        rec = provider.store.data["clients"].get(client_id) or {}
+        return rec.get("client_name") or "An MCP client"
+
+    async def wizard(request: Request) -> Response:
+        session = request.query_params.get("session", "")
+        notice_kind = request.query_params.get("notice_kind") or None
+        notice_text = request.query_params.get("notice") or None
+        sess = provider.get_pending_authorization(session)
+        if not sess:
+            return PlainTextResponse(
+                "this authorization session has expired or is unknown; "
+                "restart from your client",
+                status_code=400,
+            )
+        prefix = _forwarded_prefix(request.headers.get("x-forwarded-prefix"))
+        return _render_wizard(
+            base=prefix,
+            session=session,
+            client_name=_client_name(sess["client_id"]),
+            token_store=token_store,
+            notice_kind=notice_kind,
+            notice_text=notice_text,
+        )
+
+    async def wizard_connect(request: Request) -> Response:
+        form = await request.form()
+        session = str(form.get("session", ""))
+        if not provider.get_pending_authorization(session):
+            return PlainTextResponse("session expired", status_code=400)
+        redirect_uri = f"{_issuer_from_request(request)}/oauth/callback"
+        strava_url = strava_oauth.authorization_url(
+            redirect_uri=redirect_uri, state=session
+        )
+        return RedirectResponse(strava_url, status_code=303)
+
+    async def strava_callback(request: Request) -> Response:
+        params = dict(request.query_params)
+        session = params.get("state", "")
+        prefix = _forwarded_prefix(request.headers.get("x-forwarded-prefix"))
+        if not provider.get_pending_authorization(session):
+            return PlainTextResponse(
+                "session expired; please restart from your client", status_code=400
+            )
+        if params.get("error"):
+            qs = urllib.parse.urlencode(
+                {"session": session, "notice_kind": "err",
+                 "notice": f"Strava returned: {params['error']}"}
+            )
+            return RedirectResponse(f"{prefix}/wizard?{qs}", status_code=303)
+        code = params.get("code")
+        if not code:
+            qs = urllib.parse.urlencode(
+                {"session": session, "notice_kind": "err",
+                 "notice": "Strava did not return an authorization code"}
+            )
+            return RedirectResponse(f"{prefix}/wizard?{qs}", status_code=303)
+        try:
+            tokens = await strava_oauth.exchange_code(code=code)
+        except StravaOAuthError as e:
+            qs = urllib.parse.urlencode(
+                {"session": session, "notice_kind": "err",
+                 "notice": f"Strava exchange failed: {e.status}"}
+            )
+            return RedirectResponse(f"{prefix}/wizard?{qs}", status_code=303)
+        if not tokens.get("refresh_token"):
+            qs = urllib.parse.urlencode(
+                {"session": session, "notice_kind": "err",
+                 "notice": "Strava did not issue a refresh token; try again"}
+            )
+            return RedirectResponse(f"{prefix}/wizard?{qs}", status_code=303)
+        token_store.update_tokens(
+            access_token=tokens["access_token"],
+            refresh_token=tokens["refresh_token"],
+            expires_at=int(tokens.get("expires_at") or 0),
+        )
+        athlete = tokens.get("athlete") or {}
+        if athlete.get("id"):
+            fn = athlete.get("firstname") or ""
+            ln = athlete.get("lastname") or ""
+            label = (fn + " " + ln).strip() or str(athlete["id"])
+            token_store.set_athlete(athlete_id=athlete["id"], athlete_name=label)
+        qs = urllib.parse.urlencode(
+            {"session": session, "notice_kind": "ok",
+             "notice": f"Connected{(' as ' + (token_store.athlete_label() or '')) if token_store.athlete_label() else ''}"}
+        )
+        return RedirectResponse(f"{prefix}/wizard?{qs}", status_code=303)
+
+    async def wizard_done(request: Request) -> Response:
+        form = await request.form()
+        session = str(form.get("session", ""))
+        sess = provider.consume_pending_authorization(session)
+        if not sess:
+            return PlainTextResponse("session expired", status_code=400)
+        if not token_store.is_connected():
+            new_sid = provider.create_pending_authorization(
+                client_id=sess["client_id"],
+                redirect_uri=sess["redirect_uri"],
+                scope=sess["scope"],
+                state=sess["state"],
+                code_challenge=sess["code_challenge"],
+                code_challenge_method=sess["code_challenge_method"],
+            )
+            prefix = _forwarded_prefix(request.headers.get("x-forwarded-prefix"))
+            qs = urllib.parse.urlencode(
+                {"session": new_sid, "notice_kind": "err",
+                 "notice": "Connect Strava before finishing"}
+            )
+            return RedirectResponse(f"{prefix}/wizard?{qs}", status_code=303)
+        code = provider.issue_code(
+            client_id=sess["client_id"],
+            redirect_uri=sess["redirect_uri"],
+            scope=sess["scope"],
+            state=sess["state"],
+            code_challenge=sess["code_challenge"],
+            code_challenge_method=sess["code_challenge_method"],
+        )
+        return _redirect_to_claude(sess["redirect_uri"], code, sess["state"])
 
     async def token(request: Request) -> Response:
         try:
@@ -743,6 +978,10 @@ def make_oauth_routes(
         Route("/register", register, methods=["POST"]),
         Route("/authorize", authorize, methods=["GET", "POST"]),
         Route("/token", token, methods=["POST"]),
+        Route("/wizard", wizard, methods=["GET"]),
+        Route("/wizard/connect", wizard_connect, methods=["POST"]),
+        Route("/wizard/done", wizard_done, methods=["POST"]),
+        Route("/oauth/callback", strava_callback, methods=["GET"]),
     ]
 
 
@@ -774,7 +1013,7 @@ class StravaMCPApp:
         # Any /.well-known/* probe (OIDC discovery, host-meta, etc.) is a
         # public lookup by definition. Route them all to the OAuth Starlette
         # app so unmapped ones return 404 instead of a misleading 401.
-        if path in PUBLIC_PATHS or path.startswith("/.well-known/"):
+        if path in PUBLIC_PATHS or any(path.startswith(p) for p in PUBLIC_PREFIXES):
             await self.oauth_app(scope, receive, send)
             return
 
@@ -851,13 +1090,27 @@ def build_app(
     client: StravaClient | None = None,
     *,
     oauth_provider: OAuthProvider | None = None,
+    strava_oauth: StravaOAuthClient | None = None,
+    token_store: TokenStore | None = None,
     authorize_rate_limiter: RateLimiter | None = None,
 ):
-    if client is None:
+    if token_store is None:
         token_path = Path(os.environ.get("STRAVA_TOKEN_PATH", DEFAULT_TOKEN_PATH))
-        store = TokenStore(token_path)
-        store.load_or_seed()
-        client = StravaClient(store)
+        token_store = TokenStore(token_path)
+        token_store.load_or_seed()
+
+    if client is None:
+        client = StravaClient(token_store)
+
+    if strava_oauth is None:
+        cid = token_store.data.get("client_id") or os.environ.get("STRAVA_CLIENT_ID")
+        cs = token_store.data.get("client_secret") or os.environ.get("STRAVA_CLIENT_SECRET")
+        if not (cid and cs):
+            raise RuntimeError(
+                "STRAVA_CLIENT_ID / STRAVA_CLIENT_SECRET unavailable — needed for "
+                "the connector wizard's Strava OAuth dance."
+            )
+        strava_oauth = StravaOAuthClient(client_id=cid, client_secret=cs)
 
     if oauth_provider is None:
         oauth_path = Path(os.environ.get("OAUTH_STORE_PATH", DEFAULT_OAUTH_PATH))
@@ -885,7 +1138,10 @@ def build_app(
     mcp_app = _get_http_app(mcp)
 
     oauth_routes = make_oauth_routes(
-        oauth_provider, authorize_rate_limiter=authorize_rate_limiter
+        oauth_provider,
+        token_store=token_store,
+        strava_oauth=strava_oauth,
+        authorize_rate_limiter=authorize_rate_limiter,
     )
     oauth_app = Starlette(routes=oauth_routes)
 
