@@ -15,8 +15,13 @@ from strava_mcp.oauth import OAuthProvider, OAuthStore
 from strava_mcp.server import (
     StravaMCPApp,
     make_oauth_routes,
+    tool_activity_laps,
+    tool_activity_zones,
     tool_athlete_stats,
+    tool_athlete_zones,
     tool_get_activity,
+    tool_get_athlete,
+    tool_get_gear,
     tool_list_activities,
     tool_streams,
     tool_summarize,
@@ -306,6 +311,219 @@ async def test_streams_passes_keys_through(fresh_client):
     qs = str(route.calls.last.request.url)
     assert "keys=heartrate" in qs
     assert "key_by_type=true" in qs
+
+
+# ---------- get_athlete ----------
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_athlete_includes_gear_with_converted_distance(fresh_client):
+    respx.get("https://www.strava.com/api/v3/athlete").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": 12345,
+                "firstname": "C",
+                "lastname": "B",
+                "sex": "M",
+                "premium": True,
+                "weight": 70.0,
+                "ftp": 250,
+                "bikes": [
+                    {"id": "b1", "name": "Tarmac", "primary": True, "distance": 1609344.0},
+                ],
+                "shoes": [
+                    {"id": "g1", "name": "Pegasus", "primary": True, "distance": 804672.0},
+                ],
+            },
+        )
+    )
+    out = await tool_get_athlete(fresh_client, units="imperial")
+    assert out["id"] == 12345
+    assert out["ftp"] == 250
+    assert out["weight"] == 70.0
+    assert len(out["bikes"]) == 1
+    bike = out["bikes"][0]
+    # 1,609,344 m = 1000 mi
+    assert bike["distance"] == pytest.approx(1000.0, abs=0.01)
+    assert bike["distance_unit"] == "mi"
+    # 804,672 m = 500 mi
+    assert out["shoes"][0]["distance"] == pytest.approx(500.0, abs=0.01)
+
+
+# ---------- athlete_zones ----------
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_athlete_zones_passes_through(fresh_client):
+    payload = {
+        "heart_rate": {
+            "custom_zones": False,
+            "zones": [
+                {"min": 0, "max": 115},
+                {"min": 115, "max": 152},
+                {"min": 152, "max": 171},
+                {"min": 171, "max": 190},
+                {"min": 190, "max": -1},
+            ],
+        },
+        "power": {"zones": [{"min": 0, "max": 180}]},
+    }
+    respx.get("https://www.strava.com/api/v3/athlete/zones").mock(
+        return_value=httpx.Response(200, json=payload)
+    )
+    out = await tool_athlete_zones(fresh_client)
+    assert out == payload
+
+
+# ---------- activity_laps ----------
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_activity_laps_converts_units_and_computes_pace(fresh_client):
+    respx.get("https://www.strava.com/api/v3/activities/55/laps").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {
+                    "lap_index": 1,
+                    "name": "Lap 1",
+                    "split": 1,
+                    "start_date_local": "2024-01-15T08:00:00Z",
+                    "elapsed_time": 480,
+                    "moving_time": 480,
+                    "distance": 1609.344,  # 1 mi
+                    "total_elevation_gain": 30.48,  # 100 ft
+                    "average_speed": 3.35,  # ~7.5 mph
+                    "max_speed": 5.0,
+                    "average_heartrate": 150.0,
+                    "max_heartrate": 165.0,
+                    "average_cadence": 88.0,
+                    "start_index": 0,
+                    "end_index": 480,
+                },
+                {
+                    "lap_index": 2,
+                    "name": "Lap 2",
+                    "split": 2,
+                    "start_date_local": "2024-01-15T08:08:00Z",
+                    "elapsed_time": 450,
+                    "moving_time": 450,
+                    "distance": 1609.344,
+                    "total_elevation_gain": 0.0,
+                    "average_speed": 3.575,
+                    "start_index": 480,
+                    "end_index": 930,
+                },
+            ],
+        )
+    )
+    out = await tool_activity_laps(fresh_client, activity_id=55, units="imperial")
+    assert out["id"] == 55
+    assert out["count"] == 2
+    assert out["units"] == "imperial"
+    lap1, lap2 = out["laps"]
+    assert lap1["distance"] == pytest.approx(1.0, abs=0.001)
+    assert lap1["distance_unit"] == "mi"
+    assert lap1["total_elevation_gain"] == pytest.approx(100.0, abs=0.5)
+    assert lap1["elevation_unit"] == "ft"
+    # 480 sec / 1 mi = 8:00/mi
+    assert lap1["pace"] == "8:00/mi"
+    # 5 m/s -> 11.18 mph
+    assert lap1["max_speed"] == pytest.approx(11.185, abs=0.01)
+    # passthrough fields preserved
+    assert lap1["average_heartrate"] == 150.0
+    assert lap1["average_cadence"] == 88.0
+    assert lap1["start_index"] == 0
+    assert lap1["end_index"] == 480
+    # lap2 had no HR — that key should be absent, not None
+    assert "average_heartrate" not in lap2
+
+
+# ---------- activity_zones ----------
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_activity_zones_adds_totals_and_percents(fresh_client):
+    respx.get("https://www.strava.com/api/v3/activities/55/zones").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {
+                    "type": "heartrate",
+                    "sensor_based": True,
+                    "custom_zones": False,
+                    "score": 42,
+                    "points": 20,
+                    "max": 190,
+                    "distribution_buckets": [
+                        {"min": 0, "max": 115, "time": 100},
+                        {"min": 115, "max": 152, "time": 600},
+                        {"min": 152, "max": 171, "time": 300},
+                    ],
+                }
+            ],
+        )
+    )
+    out = await tool_activity_zones(fresh_client, activity_id=55)
+    assert out["id"] == 55
+    assert out["count"] == 1
+    z = out["zones"][0]
+    assert z["type"] == "heartrate"
+    assert z["total_time_sec"] == 1000
+    assert z["score"] == 42
+    # 600 / 1000 = 60.0%
+    assert z["distribution_buckets"][1]["percent"] == 60.0
+    assert z["distribution_buckets"][0]["time_sec"] == 100
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_activity_zones_handles_zero_total(fresh_client):
+    """Empty zone (no time recorded) shouldn't divide-by-zero."""
+    respx.get("https://www.strava.com/api/v3/activities/55/zones").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {
+                    "type": "heartrate",
+                    "distribution_buckets": [{"min": 0, "max": 115, "time": 0}],
+                }
+            ],
+        )
+    )
+    out = await tool_activity_zones(fresh_client, activity_id=55)
+    z = out["zones"][0]
+    assert z["total_time_sec"] == 0
+    assert z["distribution_buckets"][0]["percent"] == 0.0
+
+
+# ---------- get_gear ----------
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_gear_converts_distance(fresh_client):
+    respx.get("https://www.strava.com/api/v3/gear/b12345").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "b12345",
+                "name": "Tarmac",
+                "primary": True,
+                "brand_name": "Specialized",
+                "model_name": "Tarmac SL7",
+                "frame_type": 3,
+                "description": "Road bike",
+                "distance": 1609344.0,  # 1000 mi
+            },
+        )
+    )
+    out = await tool_get_gear(fresh_client, gear_id="b12345", units="imperial")
+    assert out["id"] == "b12345"
+    assert out["brand_name"] == "Specialized"
+    assert out["distance"] == pytest.approx(1000.0, abs=0.01)
+    assert out["distance_unit"] == "mi"
+    assert out["units"] == "imperial"
 
 
 # ---------- ASGI dispatcher: OAuth-issued bearer tokens gate /mcp ----------

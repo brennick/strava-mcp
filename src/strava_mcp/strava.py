@@ -164,3 +164,15 @@ class StravaClient:
             f"/activities/{activity_id}/streams",
             {"keys": ",".join(keys), "key_by_type": "true"},
         )
+
+    async def get_athlete_zones(self) -> dict[str, Any]:
+        return await self._get("/athlete/zones")
+
+    async def get_activity_laps(self, activity_id: int) -> list[dict[str, Any]]:
+        return await self._get(f"/activities/{activity_id}/laps")
+
+    async def get_activity_zones(self, activity_id: int) -> list[dict[str, Any]]:
+        return await self._get(f"/activities/{activity_id}/zones")
+
+    async def get_gear(self, gear_id: str) -> dict[str, Any]:
+        return await self._get(f"/gear/{gear_id}")

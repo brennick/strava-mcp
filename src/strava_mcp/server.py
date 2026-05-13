@@ -31,6 +31,8 @@ from .aggregations import (
     distance_value,
     elevation_unit,
     elevation_value,
+    pace_str,
+    speed_unit,
     speed_value,
     trim_activity,
 )
@@ -256,6 +258,133 @@ async def tool_streams(
     return {"id": activity_id, "keys": keys, "units": u, "streams": raw}
 
 
+def _trim_gear(g: dict[str, Any], units: str) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "id": g.get("id"),
+        "name": g.get("name"),
+        "primary": g.get("primary"),
+        "distance": round(distance_value(g.get("distance", 0) or 0, units), 2),
+        "distance_unit": distance_unit(units),
+    }
+    for k in ("brand_name", "model_name", "frame_type", "description"):
+        if g.get(k) is not None:
+            out[k] = g[k]
+    return out
+
+
+async def tool_get_athlete(
+    client: StravaClient, *, units: str | None
+) -> dict[str, Any]:
+    u = _resolve_units(client, units)
+    raw = await client.get_athlete()
+    out: dict[str, Any] = {"units": u}
+    passthrough = (
+        "id", "firstname", "lastname", "sex", "premium", "summit",
+        "city", "state", "country", "weight", "ftp",
+        "profile_medium", "profile", "created_at",
+    )
+    for k in passthrough:
+        if raw.get(k) is not None:
+            out[k] = raw[k]
+    out["bikes"] = [_trim_gear(b, u) for b in (raw.get("bikes") or [])]
+    out["shoes"] = [_trim_gear(s, u) for s in (raw.get("shoes") or [])]
+    return out
+
+
+async def tool_athlete_zones(client: StravaClient) -> dict[str, Any]:
+    return await client.get_athlete_zones()
+
+
+async def tool_activity_laps(
+    client: StravaClient, *, activity_id: int, units: str | None
+) -> dict[str, Any]:
+    u = _resolve_units(client, units)
+    raw = await client.get_activity_laps(activity_id)
+    laps: list[dict[str, Any]] = []
+    for lap in raw:
+        d_val = distance_value(lap.get("distance", 0) or 0, u)
+        moving_sec = int(lap.get("moving_time", 0) or 0)
+        out: dict[str, Any] = {
+            "lap_index": lap.get("lap_index"),
+            "name": lap.get("name"),
+            "split": lap.get("split"),
+            "start_date_local": lap.get("start_date_local") or lap.get("start_date"),
+            "elapsed_time_sec": int(lap.get("elapsed_time", 0) or 0),
+            "moving_time_sec": moving_sec,
+            "distance": round(d_val, 3),
+            "distance_unit": distance_unit(u),
+            "total_elevation_gain": round(
+                elevation_value(lap.get("total_elevation_gain", 0) or 0, u), 1
+            ),
+            "elevation_unit": elevation_unit(u),
+            "average_speed": round(speed_value(lap.get("average_speed", 0) or 0, u), 3),
+            "speed_unit": speed_unit(u),
+            "pace": pace_str(moving_sec, d_val, u),
+            # start/end stream indices: useful for slicing get_activity_streams output
+            "start_index": lap.get("start_index"),
+            "end_index": lap.get("end_index"),
+        }
+        if lap.get("max_speed") is not None:
+            out["max_speed"] = round(speed_value(lap["max_speed"], u), 3)
+        for k in (
+            "average_heartrate", "max_heartrate",
+            "average_cadence", "average_watts", "device_watts",
+            "pace_zone",
+        ):
+            if lap.get(k) is not None:
+                out[k] = lap[k]
+        laps.append(out)
+    return {"id": activity_id, "units": u, "count": len(laps), "laps": laps}
+
+
+def _summarize_zone(zone: dict[str, Any]) -> dict[str, Any]:
+    buckets = zone.get("distribution_buckets") or []
+    total = sum(int(b.get("time", 0) or 0) for b in buckets)
+    out_buckets: list[dict[str, Any]] = []
+    for b in buckets:
+        t = int(b.get("time", 0) or 0)
+        out_buckets.append(
+            {
+                "min": b.get("min"),
+                "max": b.get("max"),
+                "time_sec": t,
+                "percent": round(100 * t / total, 1) if total else 0.0,
+            }
+        )
+    out: dict[str, Any] = {
+        "type": zone.get("type"),
+        "sensor_based": zone.get("sensor_based"),
+        "custom_zones": zone.get("custom_zones"),
+        "total_time_sec": total,
+        "distribution_buckets": out_buckets,
+    }
+    for k in ("score", "points", "max"):
+        if zone.get(k) is not None:
+            out[k] = zone[k]
+    return out
+
+
+async def tool_activity_zones(
+    client: StravaClient, *, activity_id: int
+) -> dict[str, Any]:
+    raw = await client.get_activity_zones(activity_id)
+    return {
+        "id": activity_id,
+        "count": len(raw),
+        "zones": [_summarize_zone(z) for z in raw],
+    }
+
+
+async def tool_get_gear(
+    client: StravaClient, *, gear_id: str, units: str | None
+) -> dict[str, Any]:
+    u = _resolve_units(client, units)
+    raw = await client.get_gear(gear_id)
+    out = _trim_gear(raw, u)
+    out["units"] = u
+    return out
+
+
 # ---------- FastMCP wiring ----------
 
 def make_mcp(client: StravaClient) -> FastMCP:
@@ -322,6 +451,52 @@ def make_mcp(client: StravaClient) -> FastMCP:
         unit system to display.
         """
         return await tool_streams(client, activity_id=id, keys=keys, units=units)
+
+    @mcp.tool()
+    async def get_athlete(units: str | None = None) -> dict:
+        """Authenticated athlete's profile: name, FTP, weight, premium status,
+        plus the list of bikes and shoes with cumulative mileage.
+
+        Use the gear ids returned here with `get_gear` for full details on a
+        specific bike or pair of shoes.
+        """
+        return await tool_get_athlete(client, units=units)
+
+    @mcp.tool()
+    async def get_athlete_zones() -> dict:
+        """Configured heart-rate (and power, if set) zone thresholds for the
+        authenticated athlete. Pair with `get_activity_zones` to interpret
+        per-zone time distributions.
+        """
+        return await tool_athlete_zones(client)
+
+    @mcp.tool()
+    async def get_activity_laps(id: int, units: str | None = None) -> dict:
+        """Per-lap breakdown for an activity: distance, time, pace, HR, watts.
+
+        Auto-laps (e.g. Garmin's per-mile auto-laps) appear here too. `start_index`
+        and `end_index` align with `get_activity_streams` if you want to slice
+        streams to a specific lap.
+        """
+        return await tool_activity_laps(client, activity_id=id, units=units)
+
+    @mcp.tool()
+    async def get_activity_zones(id: int) -> dict:
+        """Time spent in each heart-rate (and power) zone for an activity.
+
+        Returns per-zone seconds and percent of total. The zone *definitions*
+        come from `get_athlete_zones` — interpret these buckets against those
+        thresholds.
+        """
+        return await tool_activity_zones(client, activity_id=id)
+
+    @mcp.tool()
+    async def get_gear(id: str, units: str | None = None) -> dict:
+        """Details for one piece of gear (bike or shoes) including cumulative
+        distance. Gear ids are strings like "b1234567" (bike) or "g1234567"
+        (shoes) — get them from `get_athlete` or from an activity's `gear_id`.
+        """
+        return await tool_get_gear(client, gear_id=id, units=units)
 
     return mcp
 
